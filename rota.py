@@ -228,12 +228,13 @@ def page_admin(spreadsheet):
             
             st.divider()
             
+            # --- CORREÇÃO DE CACHE ---
             # Usamos st.cache_data para não sobrecarregar a API do Google
             @st.cache_data(ttl=60)
-            def load_items(tipo):
-                return get_items(spreadsheet, tipo)
+            def load_items(_sp, tipo): # Adicionado _ (underscore)
+                return get_items(_sp, tipo)
             
-            itens_db = load_items(tipo_db)
+            itens_db = load_items(spreadsheet, tipo_db) # Passa a planilha
             
             if not itens_db:
                 st.info(f"Nenhum(a) {nome_tab.lower()} cadastrado(a).")
@@ -266,11 +267,12 @@ def page_admin(spreadsheet):
         
         st.divider()
         
+        # --- CORREÇÃO DE CACHE ---
         @st.cache_data(ttl=60)
-        def load_secoes():
-            return get_secoes(spreadsheet)
+        def load_secoes(_sp): # Adicionado _ (underscore)
+            return get_secoes(_sp)
         
-        secoes_db = load_secoes()
+        secoes_db = load_secoes(spreadsheet) # Passa a planilha
         
         if not secoes_db:
             st.info("Nenhuma seção cadastrada.")
@@ -291,17 +293,18 @@ def page_rota(spreadsheet):
     st.title("Formulário de Rota da Liderança")
 
     # Carrega dados do DB para os dropdowns
+    # --- CORREÇÃO DE CACHE ---
     @st.cache_data(ttl=60)
-    def load_all_form_data(sp):
-        lideres = get_items(sp, 'lideres')
-        turmas = get_items(sp, 'turmas')
-        rotas = get_items(sp, 'rotas')
-        maquinas = get_items(sp, 'maquinas')
-        secoes = get_secoes(sp)
+    def load_all_form_data(_sp): # Adicionado _ (underscore)
+        lideres = get_items(_sp, 'lideres')
+        turmas = get_items(_sp, 'turmas')
+        rotas = get_items(_sp, 'rotas')
+        maquinas = get_items(_sp, 'maquinas')
+        secoes = get_secoes(_sp)
         return lideres, turmas, rotas, maquinas, secoes
 
     try:
-        lideres, turmas, rotas, maquinas, secoes = load_all_form_data(spreadsheet)
+        lideres, turmas, rotas, maquinas, secoes = load_all_form_data(spreadsheet) # Passa a planilha
     except Exception as e:
         st.error(f"Falha ao carregar dados da planilha: {e}")
         return
