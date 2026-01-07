@@ -7,7 +7,7 @@ import io
 import os
 import tempfile
 import uuid
-import json # Necessário para ler sua string de conexão
+import json
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Sistema de Rotas Fitesa", layout="wide")
@@ -17,9 +17,8 @@ NOME_PLANILHA = "SistemaRotasDB"
 
 @st.cache_resource(ttl=600)
 def connect_to_gsheets():
-    """Conecta ao Google Sheets lendo a string JSON dos segredos."""
     try:
-        # CORREÇÃO: Lê a string JSON que você configurou e converte para dicionário
+        # Lê a string JSON dos segredos e converte
         json_str = st.secrets["gcp_service_account_json"]
         creds_dict = json.loads(json_str)
         
@@ -28,7 +27,6 @@ def connect_to_gsheets():
         return sh
     except Exception as e:
         st.error(f"Erro ao conectar com o Google Sheets: {e}")
-        st.error("Verifique se o segredo 'gcp_service_account_json' está correto.")
         return None
 
 def get_worksheet(spreadsheet, sheet_name):
@@ -116,7 +114,7 @@ class PDF(FPDF):
         self.set_font('Arial', 'I', 8)
         self.cell(0, 10, f'Página {self.page_no()}', 0, 0, 'C')
 
-def create_pdf(form_data, secoes_data, lista_fotos_extras):
+def create_pdf(form_data, secoes_data):
     pdf = PDF()
     pdf.add_page()
     
@@ -135,36 +133,9 @@ def create_pdf(form_data, secoes_data, lista_fotos_extras):
     pdf.multi_cell(0, 7, texto_id + texto_dados)
     pdf.ln(5)
 
-    # 2. Fotos Iniciais
-    if lista_fotos_extras:
-        pdf.set_font('Arial', 'B', 14)
-        pdf.cell(0, 10, '2. Fotos Gerais (Captura Inicial)', 0, 1)
-        pdf.ln(2)
-        
-        temp_dir = tempfile.mkdtemp()
-        
-        for idx, item_foto in enumerate(lista_fotos_extras):
-            try:
-                pdf.set_font('Arial', 'I', 10)
-                pdf.cell(0, 8, f"Foto {idx+1} - Capturada em: {item_foto['timestamp']}", 0, 1)
-                
-                tpath = os.path.join(temp_dir, f"extra_{idx}.png")
-                with open(tpath, "wb") as f:
-                    f.write(item_foto['buffer'].getbuffer())
-                
-                pdf.image(tpath, x=20, w=100)
-                pdf.ln(5)
-                os.remove(tpath)
-            except Exception as e:
-                pdf.cell(0, 10, f"Erro foto: {e}", 0, 1)
-        
-        try: os.rmdir(temp_dir)
-        except: pass
-        pdf.ln(5)
-
-    # 3. Seções
+    # 2. Seções
     pdf.set_font('Arial', 'B', 14)
-    pdf.cell(0, 10, '3. Detalhes da Rotina (Checklist)', 0, 1)
+    pdf.cell(0, 10, '2. Detalhes da Rotina (Checklist)', 0, 1)
 
     temp_dir = tempfile.mkdtemp()
     
@@ -203,7 +174,6 @@ def page_admin(spreadsheet):
     
     pwd = st.text_input("Senha ADM", type="password")
     
-    # CORREÇÃO: Lê a senha diretamente do seu formato
     if pwd != st.secrets["ADMIN_PASS"]:
         st.warning("Senha incorreta.")
         return
@@ -271,41 +241,12 @@ def init_session_state():
         st.session_state['rascunhos_rotas'] = {} 
     if 'rota_ativa_id' not in st.session_state:
         st.session_state['rota_ativa_id'] = None
-    if 'fotos_pre_rota' not in st.session_state:
-        st.session_state['fotos_pre_rota'] = []
 
 # --- INTERFACE: NOVA ROTA / LISTA ---
 def page_inicio_lista(spreadsheet):
     st.title("Central de Rotas")
     
-    # 1. Captura
-    st.write("---")
-    st.subheader("📸 Captura de Evidências (Pré-Rota)")
-    st.info("Tire fotos agora. Elas serão anexadas quando você clicar em 'Começar Rota'.")
-    
-    col_cam, col_lista = st.columns([1, 1])
-    
-    with col_cam:
-        foto_temp = st.camera_input("Tirar Foto", key="cam_temp")
-        if foto_temp:
-            ts = datetime.now().strftime("%d/%m %H:%M:%S")
-            if not st.session_state.get('last_photo_id') == foto_temp.id:
-                st.session_state['fotos_pre_rota'].append({'timestamp': ts, 'buffer': foto_temp})
-                st.session_state['last_photo_id'] = foto_temp.id
-                st.toast("Foto salva na lista temporária!")
-
-    with col_lista:
-        st.write(f"**Fotos Salvas ({len(st.session_state['fotos_pre_rota'])}):**")
-        if st.button("Limpar lista de fotos"):
-            st.session_state['fotos_pre_rota'] = []
-            st.rerun()
-            
-        for i, f in enumerate(st.session_state['fotos_pre_rota']):
-            st.text(f"📷 Foto {i+1} - {f['timestamp']}")
-
-    st.divider()
-
-    # 2. Iniciar
+    # 1. INICIAR NOVA ROTA
     st.subheader("🚀 Iniciar Nova Rota")
     
     lideres = get_items(spreadsheet, "Lideres")
@@ -336,13 +277,11 @@ def page_inicio_lista(spreadsheet):
                     "data": datetime.now().strftime("%d/%m/%Y"),
                     "id_rota": novo_id
                 },
-                "fotos_lista": st.session_state['fotos_pre_rota'].copy(),
                 "respostas_secoes": {} 
             }
             
             st.session_state['rascunhos_rotas'][novo_id] = nova_rota
             st.session_state['rota_ativa_id'] = novo_id
-            st.session_state['fotos_pre_rota'] = []
             
             registrar_inicio_rota(spreadsheet, novo_id, lider_sel)
             
@@ -351,8 +290,8 @@ def page_inicio_lista(spreadsheet):
 
     st.divider()
 
-    # 3. Continuar
-    st.subheader("📂 Rotas em Andamento (Histórico Local)")
+    # 2. CONTINUAR
+    st.subheader("📂 Rotas em Andamento (Pendentes)")
     
     rotas_abertas = st.session_state['rascunhos_rotas']
     
@@ -360,14 +299,22 @@ def page_inicio_lista(spreadsheet):
         st.info("Nenhuma rota iniciada neste dispositivo.")
     else:
         for rid, rdata in rotas_abertas.items():
+            qtd_fotos = 0
+            # Conta quantas fotos já foram salvas nas seções
+            for k, v in rdata['respostas_secoes'].items():
+                if v.get('foto'):
+                    qtd_fotos += 1
+
             with st.expander(f"📍 {rdata['inicio']} - {rdata['dados']['lider']} (Máq: {rdata['dados']['maquina']})"):
                 st.write(f"ID: {rid}")
-                st.write(f"Fotos anexadas: {len(rdata['fotos_lista'])}")
-                if st.button("Continuar Rota", key=f"btn_{rid}"):
+                st.write(f"Fotos nas seções: {qtd_fotos}")
+                
+                col_btn1, col_btn2 = st.columns(2)
+                if col_btn1.button("Continuar Rota", key=f"btn_{rid}"):
                     st.session_state['rota_ativa_id'] = rid
                     st.rerun()
                 
-                if st.button("Descartar/Excluir", key=f"del_{rid}"):
+                if col_btn2.button("Descartar/Excluir", key=f"del_{rid}"):
                     del st.session_state['rascunhos_rotas'][rid]
                     if st.session_state['rota_ativa_id'] == rid:
                         st.session_state['rota_ativa_id'] = None
@@ -376,6 +323,7 @@ def page_inicio_lista(spreadsheet):
 # --- INTERFACE: FORMULÁRIO DA ROTA ---
 def page_formulario_rota(spreadsheet):
     rid = st.session_state['rota_ativa_id']
+    # Verificação de segurança
     if not rid or rid not in st.session_state['rascunhos_rotas']:
         st.warning("Nenhuma rota selecionada. Volte ao início.")
         if st.button("Voltar"):
@@ -383,78 +331,101 @@ def page_formulario_rota(spreadsheet):
             st.rerun()
         return
 
+    # Pega a referência do objeto da rota na memória
     rota_obj = st.session_state['rascunhos_rotas'][rid]
     dados = rota_obj['dados']
+    respostas = rota_obj['respostas_secoes'] # Link direto para o dicionário
     
     st.title(f"Preenchendo: {dados['rota']}")
     st.caption(f"Líder: {dados['lider']} | Máquina: {dados['maquina']} | ID: {rid}")
     
-    if st.button("⬅️ Voltar para Lista / Salvar Rascunho"):
+    if st.button("⬅️ Salvar Rascunho e Voltar"):
         st.session_state['rota_ativa_id'] = None
         st.rerun()
 
     st.divider()
-    
-    if rota_obj['fotos_lista']:
-        st.subheader(f"Galeria de Fotos Salvas ({len(rota_obj['fotos_lista'])})")
-        cols = st.columns(3)
-        for i, foto_item in enumerate(rota_obj['fotos_lista']):
-            with cols[i % 3]:
-                st.image(foto_item['buffer'], caption=f"{foto_item['timestamp']}")
-        st.divider()
 
     secoes_db = get_secoes(spreadsheet)
-    respostas = rota_obj['respostas_secoes']
-    dados_para_pdf = [] 
+    
+    # --- LOOP DAS SEÇÕES (SEM FORMULÁRIO GIGANTE) ---
+    # Isso permite salvar cada item individualmente assim que interage
+    
+    st.subheader("Checklist da Rotina")
+    st.info("As fotos e observações são salvas automaticamente ao preencher.")
 
-    with st.form("form_rota_final"):
-        st.subheader("Checklist da Rotina")
+    for idx_secao, titulo_secao in secoes_db:
+        st.markdown(f"--- \n ### {titulo_secao}")
         
-        for idx_secao, titulo_secao in secoes_db:
-            st.markdown(f"**{titulo_secao}**")
-            
-            chave_item = str(idx_secao)
-            defaults = respostas.get(chave_item, {'obs': '', 'foto': None})
-            
-            obs = st.text_area(f"Obs: {titulo_secao}", value=defaults['obs'], key=f"obs_{rid}_{idx_secao}")
-            
-            msg_foto = "Tirar foto da seção"
-            foto_nova = st.camera_input(msg_foto, key=f"cam_{rid}_{idx_secao}")
-            
-            foto_final = None
-            if foto_nova:
-                foto_final = foto_nova
-            elif defaults['foto']:
-                foto_final = defaults['foto'] 
-                st.info("✅ Foto já capturada para este item.")
+        chave_item = str(idx_secao)
+        
+        # Garante que existe o dicionário para esse item
+        if chave_item not in respostas:
+            respostas[chave_item] = {'obs': '', 'foto': None}
+        
+        # 1. CAMPO DE OBSERVAÇÃO
+        # O on_change garante que salve ao sair do campo
+        def atualizar_obs(key=chave_item):
+             respostas[key]['obs'] = st.session_state[f"obs_{rid}_{key}"]
 
+        st.text_area(
+            "Observação:",
+            value=respostas[chave_item]['obs'],
+            key=f"obs_{rid}_{chave_item}",
+            on_change=atualizar_obs
+        )
+        
+        # 2. LÓGICA DA FOTO (Trava e Destrava)
+        foto_salva = respostas[chave_item]['foto']
+
+        if foto_salva:
+            # Se já tem foto, MOSTRA A FOTO e botão de remover
+            st.image(foto_salva, caption="Foto Salva", width=300)
+            if st.button("🗑️ Remover/Refazer Foto", key=f"del_foto_{rid}_{chave_item}"):
+                respostas[chave_item]['foto'] = None
+                st.rerun() # Recarrega para mostrar a câmera novamente
+        else:
+            # Se não tem foto, MOSTRA A CÂMERA
+            foto_nova = st.camera_input(f"Foto: {titulo_secao}", key=f"cam_{rid}_{chave_item}")
+            
+            if foto_nova:
+                # Assim que tira a foto, salva no dicionário e recarrega a página
+                respostas[chave_item]['foto'] = foto_nova
+                st.toast(f"Foto de '{titulo_secao}' salva!")
+                st.rerun()
+
+    st.divider()
+    
+    # Botão Final (fora do loop)
+    if st.button("✅ FINALIZAR ROTA E GERAR PDF", type="primary"):
+        # Prepara dados para o PDF
+        dados_para_pdf = []
+        for idx_secao, titulo_secao in secoes_db:
+            chave_item = str(idx_secao)
+            item_resp = respostas.get(chave_item, {'obs': '', 'foto': None})
+            
             dados_para_pdf.append({
                 "id": idx_secao,
                 "titulo": titulo_secao,
-                "obs": obs,
-                "foto": foto_final
+                "obs": item_resp['obs'],
+                "foto": item_resp['foto']
             })
-            
-            respostas[chave_item] = {
-                "obs": obs,
-                "foto": foto_final
-            }
 
-        st.divider()
-        submitted = st.form_submit_button("✅ Finalizar e Gerar Relatório")
+        # Gera PDF
+        pdf_bytes = create_pdf(dados, dados_para_pdf)
         
-        if submitted:
-            pdf_bytes = create_pdf(dados, dados_para_pdf, rota_obj['fotos_lista'])
-            finalizar_rota_db(spreadsheet, rid)
-            
-            nome_arq = f"Relatorio_{dados['lider']}_{rid}.pdf"
-            st.session_state['pdf_pronto'] = {'bytes': pdf_bytes, 'nome': nome_arq}
-            
-            del st.session_state['rascunhos_rotas'][rid]
-            st.session_state['rota_ativa_id'] = None
-            
-            st.success("Relatório gerado com sucesso!")
-            st.rerun()
+        # Atualiza Status no Banco
+        finalizar_rota_db(spreadsheet, rid)
+        
+        # Prepara Download
+        nome_arq = f"Relatorio_{dados['lider']}_{rid}.pdf"
+        st.session_state['pdf_pronto'] = {'bytes': pdf_bytes, 'nome': nome_arq}
+        
+        # Limpa o rascunho
+        del st.session_state['rascunhos_rotas'][rid]
+        st.session_state['rota_ativa_id'] = None
+        
+        st.success("Relatório gerado com sucesso!")
+        st.rerun()
 
 def page_download():
     st.title("Relatório Pronto")
@@ -489,7 +460,6 @@ def main():
             u = st.text_input("Usuário")
             p = st.text_input("Senha", type="password")
             if st.button("Entrar"):
-                # CORREÇÃO: Lê usuário e senha diretamente das suas variáveis soltas
                 if u == st.secrets["LOGIN_USER"] and p == st.secrets["LOGIN_PASS"]:
                     st.session_state.logged_in = True
                     st.rerun()
