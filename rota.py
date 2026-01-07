@@ -115,7 +115,7 @@ class PDF(FPDF):
         self.set_y(-15)
         self.set_font('Arial', 'I', 8)
         self.cell(0, 10, f'Página {self.page_no()}', 0, 0, 'C')
-        self.cell(0, 10, 'Gerado pelo Sistema de Rotas', 0, 0, 'R')
+        self.cell(0, 10, 'Gerado pelo Sistema de Rotas - Fitesa', 0, 0, 'R')
 
 def create_pdf(form_data, secoes_data):
     """Cria o PDF com todos os dados do formulário."""
