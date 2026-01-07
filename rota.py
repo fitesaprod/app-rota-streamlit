@@ -8,6 +8,7 @@ import os
 import tempfile
 import uuid
 import json
+import time
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Sistema de Rotas Fitesa", layout="wide")
@@ -30,6 +31,7 @@ def connect_to_gsheets():
         return None
 
 def get_worksheet(spreadsheet, sheet_name):
+    """Função auxiliar sem cache para pegar o objeto da aba"""
     try:
         return spreadsheet.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
@@ -39,13 +41,27 @@ def get_worksheet(spreadsheet, sheet_name):
         except:
             return None
 
-def get_items(spreadsheet, tipo):
-    ws = get_worksheet(spreadsheet, tipo.capitalize())
+# --- FUNÇÕES DE LEITURA COM CACHE (CORREÇÃO DO ERRO) ---
+# O underline em _spreadsheet diz pro Streamlit ignorar esse argumento no hash do cache
+
+@st.cache_data(ttl=300) # Cache de 5 minutos
+def get_items(_spreadsheet, tipo):
+    ws = get_worksheet(_spreadsheet, tipo.capitalize())
     if ws:
         vals = ws.col_values(1)
         return vals[1:] if len(vals) > 1 else []
     return []
 
+@st.cache_data(ttl=300) # Cache de 5 minutos
+def get_secoes(_spreadsheet):
+    ws = get_worksheet(_spreadsheet, "Secoes")
+    if ws:
+        data = ws.get_all_values()
+        if len(data) > 1:
+            return [(i + 2, row[0]) for i, row in enumerate(data[1:])]
+    return []
+
+# --- FUNÇÕES DE ESCRITA (SEM CACHE) ---
 def add_item(spreadsheet, tipo, nome):
     ws = get_worksheet(spreadsheet, tipo.capitalize())
     if ws:
@@ -64,14 +80,6 @@ def remove_item(spreadsheet, tipo, nome):
         except:
             pass
     return False
-
-def get_secoes(spreadsheet):
-    ws = get_worksheet(spreadsheet, "Secoes")
-    if ws:
-        data = ws.get_all_values()
-        if len(data) > 1:
-            return [(i + 2, row[0]) for i, row in enumerate(data[1:])]
-    return []
 
 def add_secao(spreadsheet, titulo):
     return add_item(spreadsheet, "Secoes", titulo)
@@ -178,6 +186,11 @@ def page_admin(spreadsheet):
         st.warning("Senha incorreta.")
         return
 
+    # Botão para forçar atualização dos dados (limpar cache)
+    if st.button("🔄 Atualizar Dados do Sistema"):
+        st.cache_data.clear()
+        st.success("Dados atualizados!")
+
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Líderes", "Turmas", "Rotas", "Máquinas", "Seções", "Histórico Logs"])
 
     configs = [
@@ -195,7 +208,7 @@ def page_admin(spreadsheet):
                 if st.form_submit_button("Adicionar"):
                     if add_item(spreadsheet, tipo, novo):
                         st.success("Adicionado!")
-                        st.cache_data.clear()
+                        st.cache_data.clear() # Limpa cache ao adicionar
             
             st.divider()
             items = get_items(spreadsheet, tipo)
@@ -204,7 +217,7 @@ def page_admin(spreadsheet):
                 c1.write(item)
                 if c2.button("X", key=f"del_{tipo}_{item}"):
                     remove_item(spreadsheet, tipo, item)
-                    st.cache_data.clear()
+                    st.cache_data.clear() # Limpa cache ao remover
                     st.rerun()
 
     with tab5: 
@@ -249,6 +262,7 @@ def page_inicio_lista(spreadsheet):
     # 1. INICIAR NOVA ROTA
     st.subheader("🚀 Iniciar Nova Rota")
     
+    # Agora chamamos as funções cacheadas (não batem na API toda vez)
     lideres = get_items(spreadsheet, "Lideres")
     maquinas = get_items(spreadsheet, "Maquinas")
     turmas = get_items(spreadsheet, "Turmas")
@@ -300,7 +314,6 @@ def page_inicio_lista(spreadsheet):
     else:
         for rid, rdata in rotas_abertas.items():
             qtd_fotos = 0
-            # Conta quantas fotos já foram salvas nas seções
             for k, v in rdata['respostas_secoes'].items():
                 if v.get('foto'):
                     qtd_fotos += 1
@@ -323,7 +336,6 @@ def page_inicio_lista(spreadsheet):
 # --- INTERFACE: FORMULÁRIO DA ROTA ---
 def page_formulario_rota(spreadsheet):
     rid = st.session_state['rota_ativa_id']
-    # Verificação de segurança
     if not rid or rid not in st.session_state['rascunhos_rotas']:
         st.warning("Nenhuma rota selecionada. Volte ao início.")
         if st.button("Voltar"):
@@ -331,10 +343,9 @@ def page_formulario_rota(spreadsheet):
             st.rerun()
         return
 
-    # Pega a referência do objeto da rota na memória
     rota_obj = st.session_state['rascunhos_rotas'][rid]
     dados = rota_obj['dados']
-    respostas = rota_obj['respostas_secoes'] # Link direto para o dicionário
+    respostas = rota_obj['respostas_secoes']
     
     st.title(f"Preenchendo: {dados['rota']}")
     st.caption(f"Líder: {dados['lider']} | Máquina: {dados['maquina']} | ID: {rid}")
@@ -345,10 +356,9 @@ def page_formulario_rota(spreadsheet):
 
     st.divider()
 
+    # AQUI ESTAVA O PROBLEMA: Chamava get_secoes toda vez que tirava foto
+    # Agora chama a versão COM CACHE
     secoes_db = get_secoes(spreadsheet)
-    
-    # --- LOOP DAS SEÇÕES (SEM FORMULÁRIO GIGANTE) ---
-    # Isso permite salvar cada item individualmente assim que interage
     
     st.subheader("Checklist da Rotina")
     st.info("As fotos e observações são salvas automaticamente ao preencher.")
@@ -358,12 +368,10 @@ def page_formulario_rota(spreadsheet):
         
         chave_item = str(idx_secao)
         
-        # Garante que existe o dicionário para esse item
         if chave_item not in respostas:
             respostas[chave_item] = {'obs': '', 'foto': None}
         
-        # 1. CAMPO DE OBSERVAÇÃO
-        # O on_change garante que salve ao sair do campo
+        # 1. OBSERVAÇÃO
         def atualizar_obs(key=chave_item):
              respostas[key]['obs'] = st.session_state[f"obs_{rid}_{key}"]
 
@@ -374,30 +382,27 @@ def page_formulario_rota(spreadsheet):
             on_change=atualizar_obs
         )
         
-        # 2. LÓGICA DA FOTO (Trava e Destrava)
+        # 2. FOTO
         foto_salva = respostas[chave_item]['foto']
 
         if foto_salva:
-            # Se já tem foto, MOSTRA A FOTO e botão de remover
             st.image(foto_salva, caption="Foto Salva", width=300)
             if st.button("🗑️ Remover/Refazer Foto", key=f"del_foto_{rid}_{chave_item}"):
                 respostas[chave_item]['foto'] = None
-                st.rerun() # Recarrega para mostrar a câmera novamente
+                st.rerun()
         else:
-            # Se não tem foto, MOSTRA A CÂMERA
             foto_nova = st.camera_input(f"Foto: {titulo_secao}", key=f"cam_{rid}_{chave_item}")
             
             if foto_nova:
-                # Assim que tira a foto, salva no dicionário e recarrega a página
                 respostas[chave_item]['foto'] = foto_nova
                 st.toast(f"Foto de '{titulo_secao}' salva!")
+                # Pequena pausa para garantir que o estado salvou antes do reload
+                time.sleep(0.5)
                 st.rerun()
 
     st.divider()
     
-    # Botão Final (fora do loop)
     if st.button("✅ FINALIZAR ROTA E GERAR PDF", type="primary"):
-        # Prepara dados para o PDF
         dados_para_pdf = []
         for idx_secao, titulo_secao in secoes_db:
             chave_item = str(idx_secao)
@@ -410,17 +415,12 @@ def page_formulario_rota(spreadsheet):
                 "foto": item_resp['foto']
             })
 
-        # Gera PDF
         pdf_bytes = create_pdf(dados, dados_para_pdf)
-        
-        # Atualiza Status no Banco
         finalizar_rota_db(spreadsheet, rid)
         
-        # Prepara Download
         nome_arq = f"Relatorio_{dados['lider']}_{rid}.pdf"
         st.session_state['pdf_pronto'] = {'bytes': pdf_bytes, 'nome': nome_arq}
         
-        # Limpa o rascunho
         del st.session_state['rascunhos_rotas'][rid]
         st.session_state['rota_ativa_id'] = None
         
