@@ -6,105 +6,173 @@ from fpdf import FPDF
 import io
 import os
 import tempfile
-import json # Necessário para carregar o segredo
+import json
+import base64
+import uuid
+
+# --- CONFIGURAÇÃO DA PÁGINA ---
+st.set_page_config(page_title="Sistema Rotas Fitesa", layout="wide")
 
 # --- CONFIGURAÇÃO DO BANCO DE DADOS (Google Sheets) ---
-
-# Nome exato da sua planilha no Google Sheets
 NOME_PLANILHA = "SistemaRotasDB"
 
 @st.cache_resource(ttl=600)
 def connect_to_gsheets():
     """Conecta ao Google Sheets usando as credenciais dos Segredos."""
     try:
-        # Carrega o segredo no formato TOML (string inteira)
-        creds_json_str = st.secrets["gcp_service_account_json"]
-        # Converte a string JSON em um dicionário
-        creds_dict = json.loads(creds_json_str)
-        
+        # Tenta carregar do formato TOML ou JSON direto
+        if "gcpserviceaccountjson" in st.secrets:
+            creds_json_str = st.secrets["gcpserviceaccountjson"]
+            creds_dict = json.loads(creds_json_str)
+        else:
+            # Fallback se estiver configurado diferente
+            creds_dict = st.secrets["gcp_service_account"]
+            
         gc = gspread.service_account_from_dict(creds_dict)
         sh = gc.open(NOME_PLANILHA)
         return sh
     except Exception as e:
-        st.error(f"Erro ao conectar com o Google Sheets: '{e}'. Verifique se o segredo 'gcp_service_account_json' está correto.")
+        st.error(f"Erro ao conectar com o Google Sheets: '{e}'. Verifique os Segredos (secrets.toml).")
         return None
 
 def get_worksheet(spreadsheet, sheet_name):
-    """Tenta obter uma aba. Se falhar, retorna None."""
+    """Obtém uma aba, cria se não existir."""
     try:
         return spreadsheet.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
-        st.error(f"Aba (worksheet) '{sheet_name}' não encontrada na planilha '{NOME_PLANILHA}'.")
-        return None
+        # Cria a aba se não existir
+        ws = spreadsheet.add_worksheet(title=sheet_name, rows=100, cols=10)
+        return ws
+
+def init_db(spreadsheet):
+    """Garante que as abas necessárias para o novo fluxo existam."""
+    # Abas de Configuração
+    get_worksheet(spreadsheet, "Lideres")
+    get_worksheet(spreadsheet, "Turmas")
+    get_worksheet(spreadsheet, "Rotas")
+    get_worksheet(spreadsheet, "Maquinas")
+    get_worksheet(spreadsheet, "Secoes")
+    
+    # Abas de Histórico/Andamento
+    ws_ativas = get_worksheet(spreadsheet, "Rotas_Ativas")
+    if not ws_ativas.get_all_values():
+        ws_ativas.append_row(["ID_Rota", "Lider", "Turma", "Rota", "Maquina", "Data_Inicio", "Status"])
+        
+    ws_fotos = get_worksheet(spreadsheet, "Fotos_Registros")
+    if not ws_fotos.get_all_values():
+        ws_fotos.append_row(["ID_Rota", "Secao_Titulo", "Data_Foto", "Obs", "Imagem_Base64"])
 
 def get_items(spreadsheet, tipo):
-    """Busca itens de um tipo específico (ex: 'Lideres')"""
-    ws = get_worksheet(spreadsheet, tipo.capitalize()) # Ex: 'lider' -> 'Lideres'
+    ws = get_worksheet(spreadsheet, tipo.capitalize())
     if ws:
-        items = ws.col_values(1)[1:] # Pula o cabeçalho "Nome"
-        return items
+        vals = ws.col_values(1)
+        return vals[1:] if len(vals) > 1 else []
     return []
 
 def add_item(spreadsheet, tipo, nome):
-    """Adiciona um novo item (ex: 'Lideres', 'nova maquina')"""
     ws = get_worksheet(spreadsheet, tipo.capitalize())
     if ws:
-        try:
-            ws.append_row([nome])
-            return True
-        except Exception as e:
-            st.error(f"Erro ao adicionar item: {e}")
-            return False
+        ws.append_row([nome])
+        return True
     return False
 
 def remove_item(spreadsheet, tipo, nome):
-    """Remove um item (pelo nome)"""
     ws = get_worksheet(spreadsheet, tipo.capitalize())
     if ws:
         try:
-            # Encontra a célula com o nome
             cell = ws.find(nome, in_column=1)
             if cell:
-                # Deleta a linha
                 ws.delete_rows(cell.row)
                 return True
-            else:
-                st.error(f"Item '{nome}' não encontrado para remoção.")
-                return False
-        except Exception as e:
-            st.error(f"Erro ao remover item: {e}")
-            return False
+        except:
+            pass
     return False
 
 def get_secoes(spreadsheet):
-    """Busca todas as seções dinâmicas"""
     ws = get_worksheet(spreadsheet, "Secoes")
     if ws:
-        # Retorna (linha, titulo) para podermos deletar pela linha
-        secoes_data = ws.get_all_values()
-        if len(secoes_data) > 1: # Se houver mais que o cabeçalho
-            # Retorna (número_da_linha, titulo)
-            return [(i + 2, secao[0]) for i, secao in enumerate(secoes_data[1:])]
+        data = ws.get_all_values()
+        if len(data) > 1:
+            return [(i + 2, row[0]) for i, row in enumerate(data[1:]) if row]
     return []
 
 def add_secao(spreadsheet, titulo):
-    """Adiciona uma nova seção"""
-    return add_item(spreadsheet, "secoes", titulo) # Reutiliza a função
+    ws = get_worksheet(spreadsheet, "Secoes")
+    ws.append_row([titulo])
+    return True
 
 def remove_secao(spreadsheet, row_index):
-    """Remove uma seção pelo índice da linha"""
     ws = get_worksheet(spreadsheet, "Secoes")
-    if ws:
-        try:
-            ws.delete_rows(row_index)
+    try:
+        ws.delete_rows(row_index)
+        return True
+    except:
+        return False
+
+# --- FUNÇÕES DE PERSISTÊNCIA (NOVA LÓGICA) ---
+
+def iniciar_nova_rota(spreadsheet, dados_inicio):
+    """Cria o registro inicial da rota."""
+    ws = get_worksheet(spreadsheet, "Rotas_Ativas")
+    id_rota = f"ROTA-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
+    
+    ws.append_row([
+        id_rota,
+        dados_inicio['lider'],
+        dados_inicio['turma'],
+        dados_inicio['rota'],
+        dados_inicio['maquina'],
+        str(datetime.now()),
+        "EM_ANDAMENTO"
+    ])
+    return id_rota
+
+def salvar_foto_registro(spreadsheet, id_rota, secao_titulo, obs, image_file):
+    """Salva a foto e obs no banco imediatamente."""
+    ws = get_worksheet(spreadsheet, "Fotos_Registros")
+    
+    # Converte imagem para Base64
+    if image_file:
+        img_bytes = image_file.getvalue()
+        base64_img = base64.b64encode(img_bytes).decode('utf-8')
+    else:
+        base64_img = ""
+        
+    data_hora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    
+    # Verifica se já existe registro dessa seção para essa rota (atualização)
+    # Lógica simplificada: Apenas adiciona nova linha. O relatório pegará a última.
+    ws.append_row([id_rota, secao_titulo, data_hora, obs, base64_img])
+
+def get_registros_rota(spreadsheet, id_rota):
+    """Busca todas as fotos/obs salvas para esta rota."""
+    ws = get_worksheet(spreadsheet, "Fotos_Registros")
+    all_rows = ws.get_all_records()
+    # Filtra pelo ID da rota
+    return [row for row in all_rows if row['ID_Rota'] == id_rota]
+
+def finalizar_rota_db(spreadsheet, id_rota):
+    """Marca a rota como finalizada (remove de ativas ou muda status)."""
+    ws = get_worksheet(spreadsheet, "Rotas_Ativas")
+    try:
+        cell = ws.find(id_rota, in_column=1)
+        if cell:
+            # Opção A: Deletar da lista de ativas
+            ws.delete_rows(cell.row)
+            # Opção B: Mudar status para FINALIZADA (Se quiser histórico permanente de logs)
+            # ws.update_cell(cell.row, 7, "FINALIZADA")
             return True
-        except Exception as e:
-            st.error(f"Erro ao remover seção: {e}")
-            return False
-    return False
+    except:
+        return False
+    return True
+
+def get_rotas_ativas(spreadsheet):
+    """Retorna lista de rotas em andamento para o menu de retomada."""
+    ws = get_worksheet(spreadsheet, "Rotas_Ativas")
+    dados = ws.get_all_records()
+    return dados
 
 # --- GERAÇÃO DE PDF ---
-
 class PDF(FPDF):
     def header(self):
         self.set_font('Arial', 'B', 12)
@@ -115,315 +183,337 @@ class PDF(FPDF):
         self.set_y(-15)
         self.set_font('Arial', 'I', 8)
         self.cell(0, 10, f'Página {self.page_no()}', 0, 0, 'C')
-        self.cell(0, 10, 'Gerado pelo Sistema de Rotas - Fitesa', 0, 0, 'R')
+        self.cell(0, 10, 'Gerado pelo Sistema de Rotas', 0, 0, 'R')
 
-def create_pdf(form_data, secoes_data):
-    """Cria o PDF com todos os dados do formulário."""
+def create_pdf(header_data, registros_secoes):
     pdf = PDF()
     pdf.add_page()
     pdf.set_font('Arial', 'B', 14)
-    
+
     # 1. Dados de Identificação
     pdf.cell(0, 10, '1. Identificação da Rota', 0, 1)
     pdf.set_font('Arial', '', 12)
     
-    # --- CORREÇÃO DE DATA ---
-    pdf.multi_cell(0, 8, f"Data: {form_data['data'].strftime('%d/%m/%Y')}\n"
-                         f"Líder: {form_data['lider']}\n"
-                         f"Turma: {form_data['turma']}\n"
-                         f"Rota: {form_data['rota']}\n"
-                         f"Máquina: {form_data['maquina']}")
+    data_fmt = header_data.get('Data_Inicio', datetime.now().strftime('%d/%m/%Y'))
+    
+    pdf.multi_cell(0, 8, f"Data Início: {data_fmt}\n"
+                         f"Líder: {header_data['Lider']}\n"
+                         f"Turma: {header_data['Turma']}\n"
+                         f"Rota: {header_data['Rota']}\n"
+                         f"Máquina: {header_data['Maquina']}")
     pdf.ln(10)
 
-    # 2. Seções da Rotina
+    # 2. Seções
     pdf.set_font('Arial', 'B', 14)
     pdf.cell(0, 10, '2. Detalhes da Rotina', 0, 1)
-    
-    # Criar pasta temporária para salvar imagens
+
     temp_dir = tempfile.mkdtemp()
+
+    # Organizar registros por seção (pegar o mais recente de cada seção)
+    # registros_secoes é uma lista de dicionários vinda do gsheets
     
-    for i, secao in enumerate(secoes_data):
-        
-        # Uma seção por folha
+    for i, reg in enumerate(registros_secoes):
         if i > 0:
             pdf.add_page()
             
         pdf.set_font('Arial', 'B', 12)
-        pdf.cell(0, 10, f"Seção: {secao['titulo']}", 0, 1)
+        pdf.cell(0, 10, f"Seção: {reg['Secao_Titulo']}", 0, 1)
         
+        pdf.set_font('Arial', 'I', 10)
+        pdf.cell(0, 10, f"Registrado em: {reg['Data_Foto']}", 0, 1)
+
         pdf.set_font('Arial', '', 12)
-        pdf.multi_cell(0, 8, f"Observação: {secao['obs']}")
-        
-        if secao['foto']:
-            foto_bytes = secao['foto'].read()
-            # Salva a imagem temporariamente para o FPDF poder usá-la
-            temp_img_path = os.path.join(temp_dir, f"temp_img_{secao['id']}.png")
-            with open(temp_img_path, 'wb') as f:
-                f.write(foto_bytes)
-            
-            # Adiciona imagem ao PDF
+        pdf.multi_cell(0, 8, f"Observação: {reg['Obs']}")
+
+        # Imagem
+        b64_img = reg.get('Imagem_Base64', '')
+        if b64_img:
             try:
-                # Imagem centralizada (x=30, w=150)
+                img_data = base64.b64decode(b64_img)
+                temp_img_path = os.path.join(temp_dir, f"img_{i}.png")
+                with open(temp_img_path, "wb") as f:
+                    f.write(img_data)
+                
                 pdf.image(temp_img_path, x=30, w=150)
+                os.remove(temp_img_path)
             except Exception as e:
                 pdf.set_text_color(255, 0, 0)
-                pdf.cell(0, 10, f"Erro ao adicionar imagem: {e}", 0, 1)
+                pdf.cell(0, 10, f"Erro ao processar imagem: {e}", 0, 1)
                 pdf.set_text_color(0, 0, 0)
-            
-            # Remove o arquivo de imagem temporário
-            os.remove(temp_img_path)
-            
+        
         pdf.ln(5)
-    
-    # Limpa a pasta temporária
+
     try:
         os.rmdir(temp_dir)
-    except OSError:
-        pass # Ignora se a pasta não estiver vazia (embora devesse estar)
-    
-    # Salva o PDF em memória
-    pdf_buffer = io.BytesIO()
-    pdf.output(pdf_buffer)
-    
-    return pdf_buffer.getvalue()
+    except:
+        pass
 
-# --- INTERFACE PRINCIPAL DO APP ---
+    return pdf.output(dest='S').encode('latin-1')
+
+# --- PÁGINAS DO APP ---
 
 def page_admin(spreadsheet):
-    """Página de Administração."""
     st.title("Área de Administração")
     
-    # Senha da área ADM (lida dos Segredos)
-    admin_password = st.text_input("Digite a senha de ADM:", type="password", key="admin_pass")
-    if admin_password != st.secrets["ADMIN_PASS"]:
+    pwd = st.text_input("Senha ADM", type="password")
+    if pwd != st.secrets.get("ADMIN_PASS", "1234"): # Senha default 1234 se não tiver nos secrets
         st.warning("Acesso restrito.")
-        return # Bloqueia o resto da página
+        return
 
-    st.success("Acesso de ADM concedido.")
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Líderes", "Turmas", "Rotas", "Máquinas", "Seções", "Limpeza"])
 
-    # Usar tabs para organizar
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Líderes", "Turmas", "Rotas", "Máquinas", "Seções"])
-
-    # Mapeamento de tipo para UI
-    tipos_gerenciamento = {
-        "Líderes": ("lideres", tab1),
-        "Turmas": ("turmas", tab2),
-        "Rotas": ("rotas", tab3),
-        "Máquinas": ("maquinas", tab4)
+    config_map = {
+        "Líderes": ("Lideres", tab1),
+        "Turmas": ("Turmas", tab2),
+        "Rotas": ("Rotas", tab3),
+        "Máquinas": ("Maquinas", tab4)
     }
 
-    for nome_tab, (tipo_db, tab) in tipos_gerenciamento.items():
+    for label, (tipo_db, tab) in config_map.items():
         with tab:
-            st.subheader(f"Gerenciar {nome_tab}")
-            
-            with st.form(f"form_add_{tipo_db}", clear_on_submit=True):
-                novo_nome = st.text_input(f"Novo(a) {nome_tab.lower()[:-1]}")
-                submitted = st.form_submit_button("Adicionar")
-                if submitted and novo_nome:
-                    if add_item(spreadsheet, tipo_db, novo_nome):
-                        st.success(f"{nome_tab[:-1]} '{novo_nome}' adicionado(a).")
-                        st.cache_data.clear() # Limpa o cache de dados
-                    else:
-                        st.error(f"Erro ao adicionar {nome_tab[:-1]}.")
+            with st.form(f"add_{tipo_db}"):
+                novo = st.text_input(f"Novo {label}")
+                if st.form_submit_button("Adicionar"):
+                    add_item(spreadsheet, tipo_db, novo)
+                    st.rerun()
             
             st.divider()
-            
-            # --- CORREÇÃO DE CACHE ---
-            # Usamos st.cache_data para não sobrecarregar a API do Google
-            @st.cache_data(ttl=60)
-            def load_items(_sp, tipo): # Adicionado _ (underscore)
-                return get_items(_sp, tipo)
-            
-            itens_db = load_items(spreadsheet, tipo_db) # Passa a planilha
-            
-            if not itens_db:
-                st.info(f"Nenhum(a) {nome_tab.lower()} cadastrado(a).")
-            else:
-                st.write(f"**{nome_tab} Cadastrados:**")
-                for item_nome in itens_db:
-                    col1, col2 = st.columns([0.8, 0.2])
-                    col1.write(item_nome)
-                    if col2.button(f"Remover", key=f"remove_{tipo_db}_{item_nome}"):
-                        if remove_item(spreadsheet, tipo_db, item_nome):
-                            st.cache_data.clear() # Limpa o cache
-                            st.rerun()
-                        else:
-                            st.error("Erro ao remover.")
+            itens = get_items(spreadsheet, tipo_db)
+            for item in itens:
+                c1, c2 = st.columns([0.8, 0.2])
+                c1.text(item)
+                if c2.button("X", key=f"del_{tipo_db}_{item}"):
+                    remove_item(spreadsheet, tipo_db, item)
+                    st.rerun()
 
-    # Gerenciamento de Seções (lógica de remoção é por linha)
     with tab5:
-        st.subheader("Gerenciar Seções da Rotina")
-        st.info("Estas são as etapas que o líder preencherá (Ex: 'Verificar EPI', 'Limpeza da Máquina')")
+        with st.form("add_sec"):
+            titulo = st.text_input("Nova Seção")
+            if st.form_submit_button("Adicionar"):
+                add_secao(spreadsheet, titulo)
+                st.rerun()
         
-        with st.form("form_add_secao", clear_on_submit=True):
-            novo_titulo = st.text_input("Título da nova seção")
-            submitted = st.form_submit_button("Adicionar Seção")
-            if submitted and novo_titulo:
-                if add_secao(spreadsheet, novo_titulo):
-                    st.success(f"Seção '{novo_titulo}' adicionada.")
-                    st.cache_data.clear() # Limpa o cache
+        st.divider()
+        secoes = get_secoes(spreadsheet)
+        for idx, tit in secoes:
+            c1, c2 = st.columns([0.8, 0.2])
+            c1.text(tit)
+            if c2.button("X", key=f"del_sec_{idx}"):
+                remove_secao(spreadsheet, idx)
+                st.rerun()
+
+    with tab6:
+        st.subheader("Manutenção do Banco de Dados")
+        st.warning("Cuidado: Isso apaga dados permanentemente.")
+        if st.button("Limpar Rotas Travadas/Antigas"):
+            # Lógica para limpar rotas antigas poderia ser implementada aqui
+            st.info("Funcionalidade de limpeza manual.")
+
+def page_nova_rota(spreadsheet):
+    """PASSO 1: Configurar e Criar a Rota"""
+    st.title("Iniciar Nova Rota")
+    
+    lideres = get_items(spreadsheet, 'Lideres')
+    turmas = get_items(spreadsheet, 'Turmas')
+    rotas = get_items(spreadsheet, 'Rotas')
+    maquinas = get_items(spreadsheet, 'Maquinas')
+
+    if not (lideres and turmas and rotas and maquinas):
+        st.error("Cadastre os dados na ADM primeiro.")
+        return
+
+    with st.form("setup_rota"):
+        c1, c2 = st.columns(2)
+        lider = c1.selectbox("Líder", lideres)
+        turma = c2.selectbox("Turma", turmas)
+        rota = c1.selectbox("Rota", rotas)
+        maquina = c2.selectbox("Máquina", maquinas)
+        
+        if st.form_submit_button("COMEÇAR ROTA"):
+            dados = {
+                "lider": lider, "turma": turma, "rota": rota, "maquina": maquina
+            }
+            id_rota = iniciar_nova_rota(spreadsheet, dados)
+            # Salva no estado da sessão para redirecionar
+            st.session_state['active_route_id'] = id_rota
+            st.session_state['active_route_data'] = dados
+            st.rerun()
+
+def page_continuar_rota(spreadsheet):
+    """Menu para retomar rotas interrompidas."""
+    st.title("Rotas em Andamento (Histórico)")
+    
+    rotas_ativas = get_rotas_ativas(spreadsheet)
+    if not rotas_ativas:
+        st.info("Nenhuma rota pendente encontrada.")
+        return
+
+    df = pd.DataFrame(rotas_ativas)
+    if not df.empty:
+        # Mostra uma tabela para o usuário escolher
+        st.dataframe(df[['Lider', 'Rota', 'Data_Inicio', 'ID_Rota']], use_container_width=True)
+        
+        ids = df['ID_Rota'].tolist()
+        selected_id = st.selectbox("Selecione a Rota para Continuar:", ids)
+        
+        if st.button("Abrir Rota Selecionada"):
+            # Recupera os dados da linha selecionada
+            row_data = df[df['ID_Rota'] == selected_id].iloc[0].to_dict()
+            
+            st.session_state['active_route_id'] = selected_id
+            st.session_state['active_route_data'] = {
+                "lider": row_data['Lider'],
+                "turma": row_data['Turma'],
+                "rota": row_data['Rota'],
+                "maquina": row_data['Maquina'],
+                "Data_Inicio": row_data['Data_Inicio']
+            }
+            st.rerun()
+
+def page_execucao_rota(spreadsheet):
+    """PASSO 2: Executar a Rota e Salvar Fotos"""
+    if 'active_route_id' not in st.session_state:
+        st.warning("Nenhuma rota ativa. Inicie uma nova ou continue uma existente.")
+        if st.button("Voltar"):
+            st.rerun()
+        return
+
+    id_rota = st.session_state['active_route_id']
+    dados_rota = st.session_state['active_route_data']
+    
+    st.markdown(f"### 🟢 Executando Rota: {dados_rota['Rota']}")
+    st.markdown(f"**Líder:** {dados_rota['lider']} | **Máquina:** {dados_rota['maquina']} | **ID:** `{id_rota}`")
+    st.divider()
+    
+    # Busca seções e registros já feitos
+    secoes = get_secoes(spreadsheet)
+    registros_feitos = get_registros_rota(spreadsheet, id_rota)
+    
+    # Mapeia registros por seção para saber o que já foi feito
+    # (Pega o último registro se houver duplicata)
+    registros_map = {r['Secao_Titulo']: r for r in registros_feitos}
+    
+    # Container para o formulário
+    # NOTA: Não usamos st.form aqui para permitir salvamento imediato por item
+    
+    for _, titulo_secao in secoes:
+        with st.container():
+            st.subheader(f"📌 {titulo_secao}")
+            
+            # Verifica se já tem foto salva
+            registro_atual = registros_map.get(titulo_secao)
+            
+            col_a, col_b = st.columns([1, 1])
+            
+            with col_a:
+                if registro_atual and registro_atual.get('Imagem_Base64'):
+                    st.success(f"✅ Salvo em: {registro_atual['Data_Foto']}")
+                    st.markdown(f"**Obs Salva:** {registro_atual['Obs']}")
+                    # Decodifica para mostrar (opcional, pode pesar se for muito)
+                    try:
+                        img_bytes = base64.b64decode(registro_atual['Imagem_Base64'])
+                        st.image(img_bytes, width=200, caption="Foto Atual")
+                    except:
+                        st.error("Erro ao carregar imagem.")
                 else:
-                    st.error("Erro ao adicionar seção.")
+                    st.info("Pendente")
+
+            with col_b:
+                # Entrada de dados para NOVA foto ou ATUALIZAÇÃO
+                # Chaves únicas para cada seção
+                obs_key = f"obs_{id_rota}_{titulo_secao}"
+                cam_key = f"cam_{id_rota}_{titulo_secao}"
+                btn_key = f"btn_{id_rota}_{titulo_secao}"
+                
+                nova_obs = st.text_area("Observação", key=obs_key)
+                nova_foto = st.camera_input("Capturar", key=cam_key)
+                
+                # Botão de salvar individual para garantir o upload
+                if nova_foto:
+                    if st.button(f"Salvar {titulo_secao}", key=btn_key, type="primary"):
+                        with st.spinner("Salvando..."):
+                            salvar_foto_registro(spreadsheet, id_rota, titulo_secao, nova_obs, nova_foto)
+                        st.success("Salvo!")
+                        st.rerun() # Atualiza a tela para mostrar a foto salva na coluna da esquerda
+    
+    st.divider()
+    st.subheader("Finalização")
+    
+    if st.button("📄 Gerar Relatório e Finalizar Rota", type="primary"):
+        # 1. Busca todos os dados atualizados do DB
+        todos_registros = get_registros_rota(spreadsheet, id_rota)
         
-        st.divider()
-        
-        # --- CORREÇÃO DE CACHE ---
-        @st.cache_data(ttl=60)
-        def load_secoes(_sp): # Adicionado _ (underscore)
-            return get_secoes(_sp)
-        
-        secoes_db = load_secoes(spreadsheet) # Passa a planilha
-        
-        if not secoes_db:
-            st.info("Nenhuma seção cadastrada.")
+        if not todos_registros:
+            st.error("Nenhuma foto foi registrada nesta rota ainda.")
         else:
-            st.write("**Seções Cadastradas (na ordem):**")
-            for row_index, secao_titulo in secoes_db:
-                col1, col2 = st.columns([0.8, 0.2])
-                col1.write(secao_titulo)
-                if col2.button(f"Remover", key=f"remove_secao_{row_index}"):
-                    if remove_secao(spreadsheet, row_index):
-                        st.cache_data.clear() # Limpa o cache
-                        st.rerun()
-                    else:
-                        st.error("Erro ao remover seção.")
-
-def page_rota(spreadsheet):
-    """Página principal de preenchimento da Rota."""
-    st.title("Formulário de Rota da Liderança")
-
-    # Carrega dados do DB para os dropdowns
-    # --- CORREÇÃO DE CACHE ---
-    @st.cache_data(ttl=60)
-    def load_all_form_data(_sp): # Adicionado _ (underscore)
-        lideres = get_items(_sp, 'lideres')
-        turmas = get_items(_sp, 'turmas')
-        rotas = get_items(_sp, 'rotas')
-        maquinas = get_items(_sp, 'maquinas')
-        secoes = get_secoes(_sp)
-        return lideres, turmas, rotas, maquinas, secoes
-
-    try:
-        lideres, turmas, rotas, maquinas, secoes = load_all_form_data(spreadsheet) # Passa a planilha
-    except Exception as e:
-        st.error(f"Falha ao carregar dados da planilha: {e}")
-        return
-
-    if not all([lideres, turmas, rotas, maquinas, secoes]):
-        st.warning("Sistema não configurado. Vá para a 'Área de Administração' e cadastre Líderes, Turmas, Rotas, Máquinas e Seções.")
-        return
-
-    # Dicionário para guardar todos os dados
-    form_data = {}
-    secoes_data = []
-
-    with st.form("form_rota", clear_on_submit=True):
-        st.header("1. Identificação")
-        
-        col1, col2 = st.columns(2)
-        # --- CORREÇÃO DE DATA ---
-        form_data['data'] = col1.date_input("Data", datetime.now(), format="DD-MM-YYYY")
-        form_data['lider'] = col1.selectbox("Líder", lideres)
-        form_data['turma'] = col2.selectbox("Turma", turmas)
-        form_data['rota'] = col2.selectbox("Rota", rotas)
-        form_data['maquina'] = st.selectbox("Máquina", maquinas)
-        
-        st.divider()
-        st.header("2. Rotina")
-        
-        if not secoes:
-            st.info("Nenhuma seção de rotina cadastrada na área ADM.")
-        
-        # Cria os campos dinâmicos para cada seção
-        for row_index, secao_titulo in secoes:
-            st.subheader(secao_titulo)
+            # 2. Gera PDF
+            pdf_bytes = create_pdf(dados_rota, todos_registros)
             
-            # Usamos a key para identificar unicamente cada widget
-            key_foto = f"foto_{row_index}"
-            key_obs = f"obs_{row_index}"
+            # 3. Disponibiliza Download
+            st.download_button(
+                label="⬇️ BAIXAR PDF",
+                data=pdf_bytes,
+                file_name=f"Rota_{dados_rota['lider']}_{id_rota}.pdf",
+                mime="application/pdf"
+            )
             
-            foto_capturada = st.camera_input("Tirar Foto", key=key_foto)
-            obs = st.text_area("Observações", key=key_obs)
-            
-            secoes_data.append({
-                "id": row_index,
-                "titulo": secao_titulo,
-                "foto": foto_capturada,
-                "obs": obs
-            })
+            # 4. Finaliza no DB (Remove da lista de ativas)
+            if finalizar_rota_db(spreadsheet, id_rota):
+                st.success("Rota finalizada e removida da lista de pendências!")
+                # Limpa sessão
+                del st.session_state['active_route_id']
+                del st.session_state['active_route_data']
+                if st.button("Voltar ao Início"):
+                    st.rerun()
 
-        st.divider()
-        submitted = st.form_submit_button("Gerar Relatório PDF")
-
-        if submitted:
-            # 1. Gerar o PDF em memória
-            pdf_bytes = create_pdf(form_data, secoes_data)
-            
-            # 2. Salvar o PDF no sistema (não salva mais em pasta, só na memória)
-            
-            # --- CORREÇÃO DE DATA ---
-            filename = f"Rota_{form_data['lider']}_{form_data['data'].strftime('%d-%m-%Y')}.pdf"
-            
-            st.success(f"Relatório '{filename}' gerado com sucesso!")
-            
-            # 3. Salvar os dados do PDF na "memória" (session_state)
-            st.session_state.pdf_bytes_to_download = pdf_bytes
-            st.session_state.pdf_filename_to_download = filename
-            
-    # 4. Exibir o botão de download FORA do formulário
-    if "pdf_bytes_to_download" in st.session_state and "pdf_filename_to_download" in st.session_state:
-        st.download_button(
-            label="Baixar PDF Gerado",
-            data=st.session_state.pdf_bytes_to_download,
-            file_name=st.session_state.pdf_filename_to_download,
-            mime="application/pdf"
-        )
-        # Limpa o estado
-        del st.session_state.pdf_bytes_to_download
-        del st.session_state.pdf_filename_to_download
-
-# --- LÓGICA PRINCIPAL (Login e Navegação) ---
+# --- MAIN ---
 
 def main():
-    st.set_page_config(page_title="Rotas", layout="wide")
-    
-    # Tenta conectar ao Google Sheets
-    spreadsheet = connect_to_gsheets()
-    if spreadsheet is None:
-        st.error("Falha ao carregar o banco de dados. Verifique a configuração.")
+    sh = connect_to_gsheets()
+    if not sh:
         return
+        
+    init_db(sh)
 
-    # Sistema de Login
+    # Sidebar Login
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
-
-    if not st.session_state.logged_in:
-        st.sidebar.title("Login")
-        user = st.sidebar.text_input("Usuário", key="login_user")
-        pwd = st.sidebar.text_input("Senha", type="password", key="login_pass")
         
+    if not st.session_state.logged_in:
+        user = st.sidebar.text_input("Usuário")
+        pwd = st.sidebar.text_input("Senha", type="password")
         if st.sidebar.button("Entrar"):
-            # Lê as credenciais dos Segredos
-            if (user == st.secrets["LOGIN_USER"] and 
-                pwd == st.secrets["LOGIN_PASS"]):
+            # Substitua pelos seus secrets reais
+            if user == st.secrets.get("LOGIN_USER", "admin") and pwd == st.secrets.get("LOGIN_PASS", "admin"):
                 st.session_state.logged_in = True
                 st.rerun()
             else:
-                st.sidebar.error("Usuário ou senha inválidos.")
-        
-        st.info("Por favor, faça o login na barra lateral para usar o sistema.")
+                st.error("Login inválido")
+        return
 
-    else:
-        # App principal
-        st.sidebar.title("Navegação")
-        st.sidebar.success(f"Logado como: {st.secrets['LOGIN_USER']}")
-        
-        pagina = st.sidebar.radio("Escolha a página:", ["Realizar Rota", "Área de Administração"])
-        
-        if pagina == "Realizar Rota":
-            page_rota(spreadsheet)
-        elif pagina == "Área de Administração":
-            page_admin(spreadsheet)
+    st.sidebar.title("Menu")
+    
+    # Lógica de Navegação
+    opcoes = ["Nova Rota", "Continuar Rota (Histórico)", "Admin"]
+    
+    # Se já estiver em rota, força a visualização ou dá opção de sair
+    if 'active_route_id' in st.session_state:
+        st.sidebar.warning("⚠️ Rota em Andamento!")
+        opcoes = ["Executando Rota", "Sair da Rota Atual", "Admin"]
+    
+    escolha = st.sidebar.radio("Ir para:", opcoes)
+    
+    if escolha == "Nova Rota":
+        page_nova_rota(sh)
+    elif escolha == "Continuar Rota (Histórico)":
+        page_continuar_rota(sh)
+    elif escolha == "Executando Rota":
+        page_execucao_rota(sh)
+    elif escolha == "Sair da Rota Atual":
+        del st.session_state['active_route_id']
+        st.rerun()
+    elif escolha == "Admin":
+        page_admin(sh)
 
 if __name__ == "__main__":
     main()
